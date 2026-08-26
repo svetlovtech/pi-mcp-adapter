@@ -613,7 +613,7 @@ export function updateStatusBar(state: McpExtensionState): void {
   }
 
   let status = footerStatus === "compact"
-    ? `MCP ${connectedCount}/${enabledCount}`
+    ? `󰘙 ${connectedCount}/${enabledCount} · ${totalToolCount(state)}t`
     : `${enabledCount} ${enabledCount === 1 ? "server" : "servers"} enabled`;
   if (footerStatus === "full") {
     if (connectedCount > 0) status += ` (${connectedCount} connected)`;
