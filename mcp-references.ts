@@ -2,6 +2,7 @@ import { isUiToolVisibleToModel } from "./ui-tool-visibility.ts";
 import { resourceNameToToolName } from "./resource-tools.ts";
 import { createCachedToolSelectorCandidateIndex, isServerCacheValid, parseDirectToolSelectors, type MetadataCache } from "./metadata-cache.ts";
 import {
+  formatServerNamespace,
   formatToolName,
   isServerDisabled,
   isToolAllowed,
@@ -34,7 +35,7 @@ type CachedServer = { serverName: string; definition: ServerEntry; entry: Server
 const BUILTIN_NAMES = new Set(["read", "bash", "edit", "write", "grep", "find", "ls", "mcp"]);
 
 export function namespaceProxyName(serverName: string): string {
-  return `mcp__${serverName.replace(/-/g, "_")}`;
+  return `mcp__${formatServerNamespace(serverName)}`;
 }
 
 export function parseMcpReference(raw: string): ParsedMcpReference {
@@ -65,21 +66,23 @@ function resolveDirectSelection(
     const selectedTools = envOverride.tools.get(serverName);
     return selectedTools ? [...selectedTools] : false;
   }
-  if (definition.directTools !== undefined) return definition.directTools;
-  return config.settings?.directTools === true;
+  // "search" registers the same tool set as `true`; only activation differs.
+  if (definition.directTools !== undefined) return definition.directTools === "search" ? true : definition.directTools;
+  return config.settings?.directTools === true || config.settings?.directTools === "search";
 }
 
 export function isMcpServerDirectlyRegistered(
-  definition: { directTools?: boolean | string[] } | undefined,
+  definition: { directTools?: boolean | string[] | "search" } | undefined,
   settings: McpConfig["settings"],
   serverName: string,
   envOverride: DirectToolSelectorOverride | null,
 ): boolean {
   if (envOverride) return envOverride.servers.has(serverName);
   if (definition?.directTools !== undefined) {
-    return definition.directTools === true || (Array.isArray(definition.directTools) && definition.directTools.length > 0);
+    return definition.directTools === true || definition.directTools === "search"
+      || (Array.isArray(definition.directTools) && definition.directTools.length > 0);
   }
-  return settings?.directTools === true;
+  return settings?.directTools === true || settings?.directTools === "search";
 }
 
 export function hasCallableCachedTargets(entry: Pick<ServerCacheEntry, "tools" | "resources">, definition: Pick<ServerEntry, "exposeResources">): boolean {

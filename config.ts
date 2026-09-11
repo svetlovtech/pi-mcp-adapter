@@ -3,12 +3,12 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, renameSync } from "
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { parse as parseToml } from "smol-toml";
-import stripJsonComments from "strip-json-comments";
 import { getAgentPath, getConfigDirName } from "./agent-dir.ts";
 import { getAgentPluginSummaries, loadAgentPluginConfigs, type AgentPluginSummary } from "./agent-plugin-loader.ts";
+import { loadClaudePluginBundles } from "./claude-plugin-loader.ts";
 import { loadPackageMcpConfigs } from "./package-mcp-loader.ts";
-import { isServerDisabled, type HostConfigDiscovery, type McpConfig, type ServerEntry, type McpSettings, type ImportKind, type ServerProvenance } from "./types.ts";
-import { toStringRecord } from "./utils.ts";
+import { formatServerNamespace, isServerDisabled, type ClaudePluginConfig, type HostConfigDiscovery, type McpConfig, type ServerEntry, type McpSettings, type ImportKind, type ServerProvenance } from "./types.ts";
+import { parseJsonWithComments, toStringRecord } from "./utils.ts";
 
 const GENERIC_GLOBAL_CONFIG_PATH = join(homedir(), ".config", "mcp", "mcp.json");
 const AGENTS_GLOBAL_CONFIG_PATHS = [
@@ -41,6 +41,16 @@ export const KNOWN_SERVER_PRESETS: readonly KnownServerPreset[] = [
     name: "Context7",
     summary: "Look up current library documentation and examples.",
     entry: { url: "https://mcp.context7.com/mcp", protocolVersion: "auto" },
+  },
+  {
+    id: "parallel-search",
+    name: "Parallel Search",
+    summary: "Search the web and fetch pages without an API key.",
+    entry: {
+      url: "https://search.parallel.ai/mcp",
+      protocolVersion: "auto",
+      directTools: true,
+    },
   },
   {
     id: "notion",
@@ -165,6 +175,8 @@ export interface ConfigWritePreview {
   diffText: string;
 }
 
+export type SharedConfigTarget = "project" | "global";
+
 export function getPiGlobalConfigPath(overridePath?: string): string {
   return overridePath ? resolve(overridePath) : getAgentPath("mcp.json");
 }
@@ -179,6 +191,10 @@ export function getProjectConfigPath(cwd = process.cwd()): string {
 
 export function getProjectPiConfigPath(cwd = process.cwd()): string {
   return resolve(cwd, getConfigDirName(), PROJECT_PI_CONFIG_NAME);
+}
+
+export function getSharedConfigPath(target: SharedConfigTarget, cwd = process.cwd()): string {
+  return target === "project" ? getProjectConfigPath(cwd) : getGenericGlobalConfigPath();
 }
 
 export function getConfigDiscoveryPaths(overridePath?: string, cwd = process.cwd()): ConfigDiscoveryPath[] {
@@ -237,7 +253,7 @@ export function getMcpDiscoverySummary(
   const includeHostConfigs = options.includeHostConfigs !== false;
 
   const importKinds = isExclusiveConfigMode()
-    ? (readValidatedConfig(getEffectivePiGlobalConfigPath(overridePath), "MCP exclusive config")?.imports ?? [])
+    ? (readValidatedConfig(getPiGlobalConfigPath(overridePath), "MCP exclusive config")?.imports ?? [])
     : (Object.keys(IMPORT_PATHS) as ImportKind[]);
   const imports = includeHostConfigs
     ? importKinds
@@ -315,14 +331,44 @@ export function loadMcpConfig(overridePath?: string, cwd = process.cwd()): McpCo
     config = mergeConfigs(config, expandImports(loaded, cwd));
   }
 
-  if (isExclusiveConfigMode()) return config;
+  if (isExclusiveConfigMode()) return resolveConfiguredClaudePluginMcp(config, cwd);
 
   const packageConfig = loadPackageMcpConfigs(cwd);
   const pluginConfig = loadAgentPluginConfigs(config.settings?.agentPluginPaths, cwd);
   const packageServers = Object.fromEntries(
     Object.entries(packageConfig.mcpServers).filter(([name]) => !Object.hasOwn(pluginConfig.mcpServers, name)),
   );
-  return mergeConfigs({ mcpServers: packageServers }, mergeConfigs(pluginConfig, config));
+  const higherPrecedenceConfig = mergeConfigs(
+    { mcpServers: packageServers },
+    mergeConfigs(pluginConfig, config),
+  );
+  return mergeClaudePluginMcpDefaults(config.claudePlugins, higherPrecedenceConfig, cwd);
+}
+
+export function resolveConfiguredClaudePluginMcp(config: McpConfig, cwd = process.cwd()): McpConfig {
+  return mergeClaudePluginMcpDefaults(config.claudePlugins, config, cwd);
+}
+
+export function discoverConfiguredClaudePluginSkills(config: McpConfig, cwd = process.cwd()): string[] {
+  return loadClaudePluginBundles(config.claudePlugins, cwd, validateConfig, { mcp: false, skills: true }).skillPaths;
+}
+
+function mergeClaudePluginMcpDefaults(
+  plugins: ClaudePluginConfig[] | undefined,
+  higherPrecedenceConfig: McpConfig,
+  cwd: string,
+): McpConfig {
+  const pluginServers = loadClaudePluginBundles(plugins, cwd, validateConfig, { mcp: true, skills: false }).mcpServers;
+  const higherNamesByNamespace = new Map(
+    Object.keys(higherPrecedenceConfig.mcpServers).map(name => [formatServerNamespace(name), name]),
+  );
+  const defaults = Object.fromEntries(Object.entries(pluginServers).filter(([name]) => {
+    const higherName = higherNamesByNamespace.get(formatServerNamespace(name));
+    if (!higherName || higherName === name) return true;
+    console.warn(`Claude plugin MCP server "${name}" is shadowed by higher-precedence server "${higherName}" because both normalize to the same namespace`);
+    return false;
+  }));
+  return mergeConfigs({ mcpServers: defaults }, higherPrecedenceConfig);
 }
 
 function getMergedSettings(overridePath?: string, cwd = process.cwd()): McpSettings | undefined {
@@ -402,7 +448,7 @@ function getConfigConflicts(
 }
 
 function getConfigSources(overridePath?: string, cwd = process.cwd()): ConfigSourceSpec[] {
-  const userPath = getEffectivePiGlobalConfigPath(overridePath);
+  const userPath = getPiGlobalConfigPath(overridePath);
   const projectPath = getProjectConfigPath(cwd);
   const projectPiPath = getProjectPiConfigPath(cwd);
   const sources: ConfigSourceSpec[] = [];
@@ -487,17 +533,15 @@ function isExclusiveConfigMode(): boolean {
   return process.env.PI_MCP_CONFIG_MODE?.trim().toLowerCase() === "exclusive";
 }
 
-function getEffectivePiGlobalConfigPath(overridePath?: string): string {
-  return getPiGlobalConfigPath(isExclusiveConfigMode() ? undefined : overridePath);
-}
-
 function mergeConfigs(base: McpConfig, next: McpConfig): McpConfig {
   const imports = mergeImports(base.imports, next.imports);
   const settings = next.settings ? { ...base.settings, ...next.settings } : base.settings;
+  const claudePlugins = next.claudePlugins ?? base.claudePlugins;
   return {
     mcpServers: mergeServerMaps(base.mcpServers, next.mcpServers),
     ...(imports !== undefined ? { imports } : {}),
     ...(settings !== undefined ? { settings } : {}),
+    ...(claudePlugins !== undefined ? { claudePlugins } : {}),
   };
 }
 
@@ -506,7 +550,7 @@ function mergeConfigs(base: McpConfig, next: McpConfig): McpConfig {
 // different url, these MUST NOT be inherited from the lower-precedence entry —
 // otherwise the original endpoint's credentials would be shipped to the new
 // url. See the SECURITY note in mergeServerMaps.
-const URL_BOUND_AUTH_FIELDS = ["headers", "bearerToken", "bearerTokenEnv", "bearerTokenStore", "requestHeadersCommand"] as const;
+const URL_BOUND_AUTH_FIELDS = ["headers", "bearerToken", "bearerTokenEnv", "bearerTokenStore", "requestHeadersCommand", "caFile"] as const;
 
 function mergeServerMaps(
   base: Record<string, ServerEntry>,
@@ -529,7 +573,7 @@ function mergeServerMaps(
     if (existing && typeof definition.command === "string") {
       baseEntry = { ...existing };
       for (const field of [
-        "url", "headers", "requestHeadersCommand", "auth", "bearerToken",
+        "url", "headers", "requestHeadersCommand", "caFile", "auth", "bearerToken",
         "bearerTokenEnv", "oauth", "httpTransport", "socket",
       ] as const) {
         delete baseEntry[field];
@@ -537,15 +581,15 @@ function mergeServerMaps(
     } else if (existing && typeof definition.url === "string") {
       baseEntry = { ...existing };
       for (const field of [
-        "command", "args", "env", "cwd", "pluginDataDir", "literalEnv", "socket",
+        "command", "args", "env", "cwd", "pluginDataDir", "literalEnv", "inheritEnv", "socket",
       ] as const) {
         delete baseEntry[field];
       }
     } else if (existing && typeof definition.socket === "string") {
       baseEntry = { ...existing };
       for (const field of [
-        "command", "args", "env", "cwd", "pluginDataDir", "literalEnv", "url",
-        "headers", "requestHeadersCommand", "auth", "bearerToken", "bearerTokenEnv",
+        "command", "args", "env", "cwd", "pluginDataDir", "literalEnv", "inheritEnv", "url",
+        "headers", "requestHeadersCommand", "caFile", "auth", "bearerToken", "bearerTokenEnv",
         "oauth", "httpTransport",
       ] as const) {
         delete baseEntry[field];
@@ -590,6 +634,7 @@ function expandImports(config: McpConfig, cwd = process.cwd()): McpConfig {
   return {
     imports: config.imports,
     ...(config.settings !== undefined ? { settings: config.settings } : {}),
+    ...(config.claudePlugins !== undefined ? { claudePlugins: config.claudePlugins } : {}),
     mcpServers: mergeServerMaps(importedServers, config.mcpServers),
   };
 }
@@ -622,13 +667,9 @@ function resolveImportCandidates(importKind: ImportKind, cwd: string): string[] 
   });
 }
 
-function parseJsonConfig(raw: string): unknown {
-  return JSON.parse(stripJsonComments(raw, { trailingCommas: true }));
-}
-
 function readImportedConfig(path: string): unknown {
   const raw = readFileSync(path, "utf-8");
-  return path.endsWith(".toml") ? parseToml(raw) : parseJsonConfig(raw);
+  return path.endsWith(".toml") ? parseToml(raw) : parseJsonWithComments(raw);
 }
 
 function loadImportedConfig(
@@ -678,7 +719,7 @@ function readValidatedConfig(path: string, label: string): McpConfig | null {
   if (!existsSync(path)) return null;
 
   try {
-    return validateConfig(parseJsonConfig(readFileSync(path, "utf-8")));
+    return validateConfig(parseJsonWithComments(readFileSync(path, "utf-8")));
   } catch (error) {
     console.warn(`Failed to load ${label}:`, error);
     return null;
@@ -694,7 +735,37 @@ function validateConfig(raw: unknown): McpConfig {
     mcpServers: toServerEntries(raw.mcpServers ?? raw["mcp-servers"]),
     ...(Array.isArray(raw.imports) ? { imports: raw.imports as ImportKind[] } : {}),
     ...(raw.settings !== undefined ? { settings: raw.settings as McpSettings } : {}),
+    ...(raw.claudePlugins !== undefined ? { claudePlugins: parseClaudePlugins(raw.claudePlugins) } : {}),
   };
+}
+
+function parseClaudePlugins(value: unknown): ClaudePluginConfig[] {
+  if (!Array.isArray(value)) {
+    console.warn("Invalid claudePlugins config: expected an array");
+    return [];
+  }
+
+  const plugins: ClaudePluginConfig[] = [];
+  for (const [index, entry] of value.entries()) {
+    if (!isRecord(entry) || typeof entry.path !== "string" || entry.path.trim().length === 0) {
+      console.warn(`Invalid claudePlugins[${index}]: expected an object with a non-empty path`);
+      continue;
+    }
+    if ((entry.mcp !== undefined && typeof entry.mcp !== "boolean") || (entry.skills !== undefined && typeof entry.skills !== "boolean")) {
+      console.warn(`Invalid claudePlugins[${index}] for ${entry.path}: mcp and skills must be booleans`);
+      continue;
+    }
+    if (entry.mcp !== true && entry.skills !== true) {
+      console.warn(`Invalid claudePlugins[${index}] for ${entry.path}: enable mcp, skills, or both`);
+      continue;
+    }
+    plugins.push({
+      path: entry.path,
+      ...(entry.mcp !== undefined ? { mcp: entry.mcp } : {}),
+      ...(entry.skills !== undefined ? { skills: entry.skills } : {}),
+    });
+  }
+  return plugins;
 }
 
 function toServerEntries(servers: unknown): Record<string, ServerEntry> {
@@ -835,6 +906,7 @@ function extractServers(config: unknown, kind: ImportKind): Record<string, Serve
             ...(typeof oauth.clientId === "string" ? { clientId: oauth.clientId } : {}),
             ...(typeof oauth.clientSecret === "string" ? { clientSecret: oauth.clientSecret } : {}),
             ...(typeof oauth.scope === "string" ? { scope: oauth.scope } : {}),
+            ...(typeof oauth.authServerMetadataUrl === "string" ? { authServerMetadataUrl: oauth.authServerMetadataUrl } : {}),
             ...(typeof oauth.skipIssuerMetadataValidation === "boolean"
               ? { skipIssuerMetadataValidation: oauth.skipIssuerMetadataValidation }
               : {}),
@@ -947,7 +1019,7 @@ function readRawConfigObject(filePath: string): Record<string, unknown> {
   if (!existsSync(filePath)) return {};
 
   try {
-    const raw = parseJsonConfig(readFileSync(filePath, "utf-8"));
+    const raw = parseJsonWithComments(readFileSync(filePath, "utf-8"));
     return raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
   } catch {
     return {};
@@ -994,7 +1066,7 @@ export function writeProjectServerDisabledOverride(
   let raw: Record<string, unknown> = {};
   if (existsSync(filePath)) {
     try {
-      const parsed = parseJsonConfig(readFileSync(filePath, "utf-8"));
+      const parsed = parseJsonWithComments(readFileSync(filePath, "utf-8"));
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
         throw new Error("root value must be an object");
       }
@@ -1148,17 +1220,25 @@ export function buildStarterProjectConfig(): McpConfig {
   };
 }
 
-export function previewStarterProjectConfig(cwd = process.cwd()): ConfigWritePreview {
-  const targetPath = getProjectConfigPath(cwd);
+export function previewStarterSharedConfig(target: SharedConfigTarget, cwd = process.cwd()): ConfigWritePreview {
+  const targetPath = getSharedConfigPath(target, cwd);
   const nextRaw = { mcpServers: buildStarterProjectConfig().mcpServers };
   return buildConfigWritePreview(targetPath, nextRaw);
 }
 
-export function writeStarterProjectConfig(cwd = process.cwd()): string {
-  const targetPath = getProjectConfigPath(cwd);
+export function writeStarterSharedConfig(target: SharedConfigTarget, cwd = process.cwd()): string {
+  const targetPath = getSharedConfigPath(target, cwd);
   const raw = { mcpServers: buildStarterProjectConfig().mcpServers };
   writeRawConfigObject(targetPath, raw);
   return targetPath;
+}
+
+export function previewStarterProjectConfig(cwd = process.cwd()): ConfigWritePreview {
+  return previewStarterSharedConfig("project", cwd);
+}
+
+export function writeStarterProjectConfig(cwd = process.cwd()): string {
+  return writeStarterSharedConfig("project", cwd);
 }
 
 export function previewSharedServerEntry(filePath: string, serverName: string, entry: ServerEntry): ConfigWritePreview {

@@ -1,15 +1,21 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, statSync } from "node:fs";
+import { BlockList, isIP } from "node:net";
 import { isDeepStrictEqual } from "node:util";
 import {
   Client,
   SdkError,
   SdkErrorCode,
   SdkHttpError,
+  SseError,
   SSEClientTransport,
   StreamableHTTPClientTransport,
   UnauthorizedError,
+  type FetchLike,
   type GetPromptResult,
+  type ListToolsResult,
   type ReadResourceResult,
+  type McpSubscription,
+  type SubscriptionFilter,
   type CacheableRequestOptions,
   type RequestOptions,
   type UrlElicitationRequiredError,
@@ -27,15 +33,18 @@ import {
   type ServerStreamResultPatchNotification,
   type Transport,
   type McpTraceSettings,
+  type McpListenState,
   SERVER_STREAM_RESULT_PATCH_METHOD,
   serverStreamResultPatchNotificationSchema,
 } from "./types.ts";
 import { resolveNpxBinary } from "./npx-resolver.ts";
 import { createJsonSchemaValidator } from "./json-schema-validator.ts";
 import { logger } from "./logger.ts";
+import { RESOURCE_MIME_TYPE } from "./ui-app-bridge-helpers.ts";
 import { McpOAuthProvider } from "./mcp-oauth-provider.ts";
 import { extractOAuthConfig, supportsOAuth, type McpOAuthRuntime } from "./mcp-auth-flow.ts";
-import { invalidateAuthEntryCache, type AuthStorageOptions } from "./mcp-auth.ts";
+import { createOAuthAwareFetch } from "./mcp-auth-fetch.ts";
+import { inspectAuthForUrl, invalidateAuthEntryCache, type AuthStorageOptions } from "./mcp-auth.ts";
 import { getBearerTokenForUrl } from "./mcp-bearer-store.ts";
 import { registerSamplingHandler, type ServerSamplingConfig } from "./sampling-handler.ts";
 import {
@@ -61,7 +70,9 @@ import {
   traceTransportKind,
   wrapTransportWithMcpTrace,
 } from "./mcp-trace.ts";
+import { createOAuthFetch, resolveOAuthHeaders } from "./mcp-auth-fetch.ts";
 import { createRequestHeadersCommandFetch } from "./request-headers-command.ts";
+import { createCaFetch, validateCaFile } from "./http-ca.ts";
 
 const MAX_CAPTURED_STDERR_BYTES = 8 * 1024;
 const MAX_CAPTURED_STDERR_LINES = 3;
@@ -70,8 +81,38 @@ const abortCleanupPromises = new WeakMap<object, Promise<void>>();
 type HttpAuthProviderState =
   | { status: "disabled" }
   | { status: "implicit-deferred" }
+  | { status: "implicit-stored"; provider: McpOAuthProvider }
   | { status: "explicit"; provider: McpOAuthProvider }
   | { status: "implicit-challenged"; provider: McpOAuthProvider };
+
+function isLiteralLocalAddress(url: string): boolean {
+  const hostname = new URL(url).hostname.replace(/^\[|\]$/g, "");
+  const family = isIP(hostname);
+  if (!family) return false;
+  const local = new BlockList();
+  local.addSubnet("10.0.0.0", 8);
+  local.addSubnet("172.16.0.0", 12);
+  local.addSubnet("192.168.0.0", 16);
+  local.addSubnet("169.254.0.0", 16);
+  local.addSubnet("fc00::", 7, "ipv6");
+  local.addSubnet("fe80::", 10, "ipv6");
+  return local.check(hostname, family === 6 ? "ipv6" : "ipv4");
+}
+
+function localNetworkFailureCodes(error: unknown, seen = new Set<object>()): string[] {
+  if (typeof error !== "object" || error === null || seen.has(error)) return [];
+  seen.add(error);
+  const codes: string[] = [];
+  if ("code" in error && typeof error.code === "string"
+    && ["EHOSTUNREACH", "ENETUNREACH", "EACCES"].includes(error.code)) {
+    codes.push(error.code);
+  }
+  if ("cause" in error) codes.push(...localNetworkFailureCodes(error.cause, seen));
+  if (error instanceof AggregateError) {
+    for (const nested of error.errors) codes.push(...localNetworkFailureCodes(nested, seen));
+  }
+  return [...new Set(codes)];
+}
 
 function isUnauthorizedHttpError(error: unknown): boolean {
   return error instanceof UnauthorizedError || (error instanceof SdkHttpError && error.status === 401);
@@ -128,6 +169,8 @@ export interface ServerConnection {
   transport: Transport;
   definition: ServerDefinition;
   tools: McpTool[];
+  /** Cache hints from the server's aggregated tools/list result. */
+  toolListHints?: Partial<Pick<ListToolsResult, "ttlMs" | "cacheScope">> | undefined;
   /** Monotonic guard against older refresh responses replacing newer notifications. */
   toolsRevision?: number;
   resources: McpResource[];
@@ -138,6 +181,18 @@ export interface ServerConnection {
   lastUsedAt: number;
   inFlight: number;
   status: "connected" | "closed" | "needs-auth";
+  /** Catalog subscription health, tracked independently from transport health. */
+  listenState: McpListenState;
+  listenSubscription?: McpSubscription;
+  /** Last requested filter; the server's honored filter may be a subset. */
+  listenFilter?: SubscriptionFilter;
+  /** True when recovery has an active listen but could not confirm every catalog list. */
+  listenCatalogStale?: boolean;
+  listenPromise?: Promise<void>;
+  listenRetryAfter?: number;
+  listenStopped?: boolean;
+  recentResourceUris?: Map<string, number>;
+  resourceReadRefreshUris?: Set<string>;
   /** True once this needs-auth episode discarded the cached credential. */
   credentialsInvalidated?: boolean;
 }
@@ -145,10 +200,18 @@ export interface ServerConnection {
 
 type UiStreamListener = (serverName: string, notification: ServerStreamResultPatchNotification["params"]) => void;
 type MetadataListChangedListener = (serverName: string, reason: string) => void;
+type ListenStateChangedListener = (serverName: string, state: McpListenState) => void;
+type ResourceUpdatedListener = (serverName: string, uri: string) => void;
 
 export type ToolRefreshResult = "updated" | "unchanged" | "superseded" | "refresh-timeout";
 
+type ToolListCacheHints = Partial<Pick<ListToolsResult, "ttlMs" | "cacheScope">>;
+type ToolListResult = { tools: McpTool[]; hints?: ToolListCacheHints };
+
 const KEEP_ALIVE_REFRESH_TIMEOUT_MS = 5_000;
+const LISTEN_RETRY_DELAY_MS = 5_000;
+const RECENT_RESOURCE_TTL_MS = 10 * 60_000;
+const MAX_RESOURCE_SUBSCRIPTIONS = 32;
 
 export function isTransientHttpConnectError(error: unknown): boolean {
   let current: unknown = error;
@@ -166,6 +229,12 @@ export class McpServerManager {
   private uiStreamListeners = new Map<string, UiStreamListener>();
   private samplingConfig: ServerSamplingConfig | undefined;
   private metadataListChangedListener: MetadataListChangedListener | undefined;
+  private listenStateChangedListener: ListenStateChangedListener | undefined;
+  private resourceUpdatedListeners = new Map<string, {
+    serverName: string;
+    uri: string;
+    listener: ResourceUpdatedListener;
+  }>();
   private pendingMetadataPublications = new Map<
     string,
     { connection: ServerConnection; reason: string }
@@ -192,6 +261,10 @@ export class McpServerManager {
 
   setMetadataListChangedListener(listener: MetadataListChangedListener | undefined): void {
     this.metadataListChangedListener = listener;
+  }
+
+  setListenStateChangedListener(listener: ListenStateChangedListener | undefined): void {
+    this.listenStateChangedListener = listener;
   }
 
   publishMetadataChanged(
@@ -267,6 +340,7 @@ export class McpServerManager {
   }
 
   async connect(name: string, definition: ServerDefinition, signal?: AbortSignal): Promise<ServerConnection> {
+    validateCaFile(definition);
     if (isServerDisabled(definition)) throw new Error(`MCP server "${name}" is disabled`);
     if (this.stopped) throw new Error("MCP server manager is closed");
     const ownedSignal = combineAbortSignals(this.runtimeSignal, signal);
@@ -306,6 +380,10 @@ export class McpServerManager {
         throw new Error(`MCP connection for ${name} was closed while connecting`);
       }
       this.connections.set(name, connection);
+      this.watchListenSubscription(name, connection, connection.listenSubscription);
+      if ([...this.resourceUpdatedListeners.values()].some(registration => registration.serverName === name)) {
+        void this.ensureListen(name, connection);
+      }
       return connection;
     } finally {
       if (this.connectPromises.get(name) === promise) this.connectPromises.delete(name);
@@ -366,6 +444,8 @@ export class McpServerManager {
       return "superseded";
     }
 
+    await this.ensureListen(name, expectedConnection);
+
     const requestOptions = this.buildRequestOptions(expectedConnection.definition, signal);
     const timeout = Math.min(requestOptions?.timeout ?? KEEP_ALIVE_REFRESH_TIMEOUT_MS, KEEP_ALIVE_REFRESH_TIMEOUT_MS);
     const healthOptions = {
@@ -384,9 +464,9 @@ export class McpServerManager {
 
     const toolsRevision = expectedConnection.toolsRevision ?? 0;
     const refreshSignal = combineAbortSignals(healthOptions.signal, AbortSignal.timeout(timeout));
-    let tools: McpTool[];
+    let toolResult: ToolListResult;
     try {
-      tools = await this.fetchAllTools(expectedConnection.client, {
+      toolResult = await this.fetchAllTools(expectedConnection.client, {
         ...healthOptions,
         ...(refreshSignal ? { signal: refreshSignal } : {}),
         cacheMode: "refresh",
@@ -410,20 +490,30 @@ export class McpServerManager {
       return "superseded";
     }
 
-    if (isDeepStrictEqual(expectedConnection.tools, tools)) {
+    if (
+      isDeepStrictEqual(expectedConnection.tools, toolResult.tools) &&
+      isDeepStrictEqual(expectedConnection.toolListHints, toolResult.hints)
+    ) {
       this.retryPendingMetadataPublication(name, expectedConnection);
       return "unchanged";
     }
 
     const previousTools = expectedConnection.tools;
-    expectedConnection.tools = tools;
+    const previousToolListHints = expectedConnection.toolListHints;
+    expectedConnection.tools = toolResult.tools;
+    expectedConnection.toolListHints = toolResult.hints;
     expectedConnection.toolsRevision = toolsRevision + 1;
     try {
       await this.metadataListChangedListener?.(name, "keep-alive-refresh");
       this.pendingMetadataPublications.delete(name);
     } catch (error) {
-      if (this.connections.get(name) === expectedConnection && expectedConnection.tools === tools) {
+      if (
+        this.connections.get(name) === expectedConnection &&
+        expectedConnection.tools === toolResult.tools &&
+        expectedConnection.toolListHints === toolResult.hints
+      ) {
         expectedConnection.tools = previousTools;
+        expectedConnection.toolListHints = previousToolListHints;
         expectedConnection.toolsRevision = toolsRevision;
       }
       throw error;
@@ -438,6 +528,250 @@ export class McpServerManager {
     if (this.pendingMetadataPublications.get(name) === pendingPublication) {
       this.pendingMetadataPublications.delete(name);
     }
+  }
+
+  private setListenState(name: string, connection: ServerConnection, state: McpListenState): void {
+    if (connection.listenState === state) return;
+    connection.listenState = state;
+    if (this.connections.get(name) === connection) {
+      try {
+        this.listenStateChangedListener?.(name, state);
+      } catch {
+        // Status consumers must not interrupt listen lifecycle recovery.
+      }
+    }
+  }
+
+  private catalogListenFilter(connection: ServerConnection): SubscriptionFilter {
+    const capabilities = connection.client.getServerCapabilities?.();
+    return {
+      ...(capabilities?.tools?.listChanged ? { toolsListChanged: true } : {}),
+      ...(capabilities?.prompts?.listChanged ? { promptsListChanged: true } : {}),
+      ...(capabilities?.resources?.listChanged ? { resourcesListChanged: true } : {}),
+    };
+  }
+
+  private currentListenFilter(name: string, connection: ServerConnection): SubscriptionFilter {
+    const now = Date.now();
+    const recent = connection.recentResourceUris;
+    if (recent) {
+      for (const [uri, touchedAt] of recent) {
+        if (now - touchedAt > RECENT_RESOURCE_TTL_MS) recent.delete(uri);
+      }
+    }
+    const openResourceUris = [...new Set(
+      [...this.resourceUpdatedListeners.values()]
+        .filter(registration => registration.serverName === name)
+        .map(registration => registration.uri),
+    )].slice(-MAX_RESOURCE_SUBSCRIPTIONS);
+    const openSet = new Set(openResourceUris);
+    const recentSlots = MAX_RESOURCE_SUBSCRIPTIONS - openResourceUris.length;
+    const recentResourceUris = recentSlots > 0
+      ? [...(recent?.keys() ?? [])].filter(uri => !openSet.has(uri)).slice(-recentSlots)
+      : [];
+    const resourceSubscriptions = [...openResourceUris, ...recentResourceUris];
+    return {
+      ...this.catalogListenFilter(connection),
+      ...(resourceSubscriptions.length > 0 ? { resourceSubscriptions } : {}),
+    };
+  }
+
+  private watchListenSubscription(
+    name: string,
+    connection: ServerConnection,
+    subscription: McpSubscription | undefined,
+  ): void {
+    if (!subscription) return;
+    void subscription.closed.then(cause => {
+      if (
+        this.stopped ||
+        this.connections.get(name) !== connection ||
+        connection.status !== "connected" ||
+        connection.listenSubscription !== subscription
+      ) return;
+      if (cause === "remote") {
+        const staleUris = connection.listenFilter?.resourceSubscriptions ?? [];
+        if (staleUris.length > 0) connection.resourceReadRefreshUris = new Set(staleUris);
+        connection.listenCatalogStale = true;
+        connection.listenRetryAfter = Date.now();
+        this.setListenState(name, connection, "dropped");
+      } else if (cause === "graceful" || connection.listenState !== "re-establishing") {
+        connection.listenStopped = true;
+        this.setListenState(name, connection, "not-listening");
+      }
+    });
+  }
+
+  /** Quietly repairs a modern catalog listen at an existing activity boundary. */
+  async ensureListen(name: string, expectedConnection: ServerConnection): Promise<void> {
+    if (
+      this.stopped ||
+      this.connections.get(name) !== expectedConnection ||
+      expectedConnection.status !== "connected" ||
+      expectedConnection.listenStopped ||
+      expectedConnection.client.getProtocolEra?.() !== "modern"
+    ) return;
+
+    const filter = this.currentListenFilter(name, expectedConnection);
+    if (Object.keys(filter).length === 0) {
+      this.setListenState(name, expectedConnection, "not-listening");
+      return;
+    }
+    if (expectedConnection.listenPromise) {
+      await expectedConnection.listenPromise;
+      return this.ensureListen(name, expectedConnection);
+    }
+    if ((expectedConnection.listenRetryAfter ?? 0) > Date.now()) return;
+
+    const sameFilter = isDeepStrictEqual(expectedConnection.listenFilter, filter);
+    if (expectedConnection.listenState === "active" && sameFilter) {
+      if (!expectedConnection.listenCatalogStale) return;
+      const attempt = (async () => {
+        this.setListenState(name, expectedConnection, "re-establishing");
+        const confirmed = await this.reconcileCatalogAfterListen(name, expectedConnection, this.buildRequestOptions(expectedConnection.definition));
+        if (!confirmed) expectedConnection.listenRetryAfter = Date.now() + LISTEN_RETRY_DELAY_MS;
+        this.setListenState(name, expectedConnection, "active");
+      })().finally(() => {
+        if (expectedConnection.listenPromise === attempt) delete expectedConnection.listenPromise;
+      });
+      expectedConnection.listenPromise = attempt;
+      return attempt;
+    }
+
+    const attempt = (async () => {
+      const recoverDroppedListen = expectedConnection.listenState === "dropped";
+      this.setListenState(name, expectedConnection, "re-establishing");
+      const previous = expectedConnection.listenSubscription;
+      if (previous) await previous.close().catch(() => {});
+      if (this.connections.get(name) !== expectedConnection || expectedConnection.status !== "connected") return;
+      try {
+        const requestOptions = this.buildRequestOptions(expectedConnection.definition);
+        const subscription = await expectedConnection.client.listen(
+          filter,
+          {
+            ...requestOptions,
+            timeout: Math.min(requestOptions?.timeout ?? KEEP_ALIVE_REFRESH_TIMEOUT_MS, KEEP_ALIVE_REFRESH_TIMEOUT_MS),
+          },
+        );
+        if (this.connections.get(name) !== expectedConnection || expectedConnection.status !== "connected") {
+          await subscription.close().catch(() => {});
+          return;
+        }
+        expectedConnection.listenSubscription = subscription;
+        expectedConnection.listenFilter = filter;
+        delete expectedConnection.listenStopped;
+        delete expectedConnection.listenRetryAfter;
+        this.watchListenSubscription(name, expectedConnection, subscription);
+        const confirmed = recoverDroppedListen
+          ? await this.reconcileCatalogAfterListen(name, expectedConnection, requestOptions)
+          : true;
+        if (!confirmed) expectedConnection.listenRetryAfter = Date.now() + LISTEN_RETRY_DELAY_MS;
+        this.setListenState(name, expectedConnection, "active");
+      } catch (error) {
+        if (this.connections.get(name) !== expectedConnection || expectedConnection.status !== "connected") return;
+        if (expectedConnection.listenSubscription) await expectedConnection.listenSubscription.close().catch(() => {});
+        expectedConnection.listenRetryAfter = Date.now() + LISTEN_RETRY_DELAY_MS;
+        this.setListenState(name, expectedConnection, "dropped");
+        logger.debug(`MCP: catalog listen repair failed for ${name}: ${error instanceof Error ? error.message : String(error)}`);
+      }
+    })().finally(() => {
+      if (expectedConnection.listenPromise === attempt) delete expectedConnection.listenPromise;
+    });
+    expectedConnection.listenPromise = attempt;
+    return attempt;
+  }
+
+  private async reconcileCatalogAfterListen(
+    name: string,
+    expectedConnection: ServerConnection,
+    requestOptions?: CacheableRequestOptions,
+  ): Promise<boolean> {
+    const timeout = Math.min(requestOptions?.timeout ?? KEEP_ALIVE_REFRESH_TIMEOUT_MS, KEEP_ALIVE_REFRESH_TIMEOUT_MS);
+    const refreshSignal = combineAbortSignals(requestOptions?.signal, AbortSignal.timeout(timeout));
+    const refreshOptions: CacheableRequestOptions = {
+      ...requestOptions,
+      timeout,
+      cacheMode: "refresh",
+      ...(refreshSignal ? { signal: refreshSignal } : {}),
+    };
+    const [toolResult, resources, promptResult] = await Promise.allSettled([
+      this.fetchAllTools(expectedConnection.client, refreshOptions),
+      this.fetchAllResources(expectedConnection.client, refreshOptions, true),
+      this.fetchAllPrompts(expectedConnection.client, refreshOptions),
+    ]);
+    if (this.connections.get(name) !== expectedConnection || expectedConnection.status !== "connected") return false;
+
+    const nextTools = toolResult.status === "fulfilled" ? toolResult.value : undefined;
+    const nextResources = resources.status === "fulfilled" ? resources.value : undefined;
+    const nextPrompts = promptResult.status === "fulfilled" && !promptResult.value.failed ? promptResult.value : undefined;
+    const confirmed = nextTools !== undefined && nextResources !== undefined && nextPrompts !== undefined;
+    const changed = (nextTools !== undefined && (
+      !isDeepStrictEqual(expectedConnection.tools, nextTools.tools) ||
+      !isDeepStrictEqual(expectedConnection.toolListHints, nextTools.hints)
+    )) ||
+      (nextResources !== undefined && !isDeepStrictEqual(expectedConnection.resources, nextResources)) ||
+      (nextPrompts !== undefined && (
+        !isDeepStrictEqual(expectedConnection.prompts, nextPrompts.prompts) ||
+        expectedConnection.promptDiscoveryFailed !== false
+      ));
+    if (!changed) {
+      this.retryPendingMetadataPublication(name, expectedConnection);
+      if (confirmed) delete expectedConnection.listenCatalogStale;
+      else expectedConnection.listenCatalogStale = true;
+      return confirmed;
+    }
+
+    if (nextTools !== undefined) {
+      expectedConnection.tools = nextTools.tools;
+      expectedConnection.toolListHints = nextTools.hints;
+      expectedConnection.toolsRevision = (expectedConnection.toolsRevision ?? 0) + 1;
+    }
+    if (nextResources !== undefined) expectedConnection.resources = nextResources;
+    if (nextPrompts !== undefined) {
+      expectedConnection.prompts = nextPrompts.prompts;
+      expectedConnection.promptDiscoveryFailed = false;
+    }
+    if (confirmed) delete expectedConnection.listenCatalogStale;
+    else expectedConnection.listenCatalogStale = true;
+    this.metadataListChangedListener?.(name, "listen-recovered");
+    this.pendingMetadataPublications.delete(name);
+    return confirmed;
+  }
+
+  async prepareResourceUse(name: string, uri: string, expectedConnection: ServerConnection): Promise<boolean> {
+    if (this.connections.get(name) !== expectedConnection || expectedConnection.status !== "connected") return false;
+    const refreshRead = expectedConnection.listenState === "dropped" ||
+      expectedConnection.listenState === "re-establishing" ||
+      expectedConnection.resourceReadRefreshUris?.has(uri) === true;
+    const recent = expectedConnection.recentResourceUris ?? new Map<string, number>();
+    recent.delete(uri);
+    recent.set(uri, Date.now());
+    while (recent.size > MAX_RESOURCE_SUBSCRIPTIONS) {
+      const oldest = recent.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      recent.delete(oldest);
+    }
+    expectedConnection.recentResourceUris = recent;
+    await this.ensureListen(name, expectedConnection);
+    expectedConnection.resourceReadRefreshUris?.delete(uri);
+    return refreshRead;
+  }
+
+  registerResourceUpdatedListener(
+    token: string,
+    serverName: string,
+    uri: string,
+    listener: ResourceUpdatedListener,
+  ): void {
+    this.removeResourceUpdatedListener(token);
+    this.resourceUpdatedListeners.set(token, { serverName, uri, listener });
+    const connection = this.connections.get(serverName);
+    if (!connection || connection.status !== "connected") return;
+    void this.prepareResourceUse(serverName, uri, connection);
+  }
+
+  removeResourceUpdatedListener(token: string): void {
+    this.resourceUpdatedListeners.delete(token);
   }
 
   private async doReconnect(
@@ -498,6 +832,12 @@ export class McpServerManager {
       client = this.createClient(name, definition);
       let command = definition.command;
       let args = (definition.args ?? []).map((argument) => interpolateEnvVars(argument));
+      const cwd = resolveConfigPath(definition.cwd) ?? this.defaultCwd;
+      if (cwd !== undefined) {
+        const cwdStats = statSync(cwd, { throwIfNoEntry: false });
+        if (!cwdStats) throw new Error(`MCP server "${name}" configured cwd does not exist: "${cwd}"`);
+        if (!cwdStats.isDirectory()) throw new Error(`MCP server "${name}" configured cwd is not a directory: "${cwd}"`);
+      }
 
       if (command === "npx" || command === "npm") {
         const resolved = await resolveNpxBinary(command, args, signal);
@@ -510,11 +850,15 @@ export class McpServerManager {
       throwIfAborted(signal);
 
       if (definition.pluginDataDir) mkdirSync(definition.pluginDataDir, { recursive: true });
-      const cwd = resolveConfigPath(definition.cwd) ?? this.defaultCwd;
       const stdioTransport = new StdioClientTransport({
         command,
         args,
-        env: resolveEnv(definition.env, name, definition.literalEnv === true),
+        env: resolveEnv(
+          definition.env,
+          name,
+          definition.literalEnv === true,
+          definition.inheritEnv !== false,
+        ),
         ...(cwd !== undefined ? { cwd } : {}),
         stderr: definition.debug ? "inherit" : "pipe",
       });
@@ -549,6 +893,7 @@ export class McpServerManager {
           lastUsedAt: Date.now(),
           inFlight: 0,
           status: "needs-auth",
+          listenState: "disconnected",
           credentialsInvalidated: invalidated,
         };
       }
@@ -572,6 +917,8 @@ export class McpServerManager {
       this.attachAdapterNotificationHandlers(name, client);
 
       const instructions = client.getInstructions?.();
+      const protocolEra = client.getProtocolEra?.();
+      const autoOpenedSubscription = client.autoOpenedSubscription;
       const connection: ServerConnection = {
         client,
         transport,
@@ -584,7 +931,16 @@ export class McpServerManager {
         lastUsedAt: Date.now(),
         inFlight: 0,
         status: "connected",
+        listenState: protocolEra === "modern"
+          ? autoOpenedSubscription
+            ? "active"
+            : "not-listening"
+          : "legacy",
+        ...(autoOpenedSubscription ? {
+          listenSubscription: autoOpenedSubscription,
+        } : {}),
       };
+      if (autoOpenedSubscription) connection.listenFilter = this.catalogListenFilter(connection);
 
       // Reflect the SDK's own close signal in connection status, guarded by
       // identity so a stale connection's late close can never clobber a fresh
@@ -597,12 +953,13 @@ export class McpServerManager {
 
       // Discover tools, resources, and prompts. Resource and prompt listing is
       // optional: only servers advertising the capability are queried.
-      const [tools, resources, promptResult] = await Promise.all([
+      const [toolResult, resources, promptResult] = await Promise.all([
         this.fetchAllTools(client, requestOptions),
         this.fetchAllResources(client, requestOptions),
         this.fetchAllPrompts(client, requestOptions),
       ]);
-      connection.tools = tools;
+      connection.tools = toolResult.tools;
+      connection.toolListHints = toolResult.hints;
       connection.resources = resources;
       connection.prompts = promptResult.prompts;
       connection.promptDiscoveryFailed = promptResult.failed;
@@ -641,6 +998,7 @@ export class McpServerManager {
           lastUsedAt: Date.now(),
           inFlight: 0,
           status: "needs-auth",
+          listenState: "disconnected",
           credentialsInvalidated: invalidated,
         };
       }
@@ -660,6 +1018,12 @@ export class McpServerManager {
 
   private async enrichHttpConnectionError(definition: ServerDefinition, error: unknown): Promise<Error> {
     const originalMessage = error instanceof Error ? error.message : String(error);
+    if (process.platform === "darwin") {
+      const codes = localNetworkFailureCodes(error);
+      if (codes.length > 0 && isLiteralLocalAddress(resolveServerUrl(definition)!)) {
+        return new Error(`${originalMessage} — ${codes.join(", ")} — macOS Local Network Privacy may be blocking access. Check System Settings > Privacy & Security > Local Network for the app hosting Pi; enable access if listed and restart it. Try launching Pi from Terminal.app or SSH. Routing or firewall problems can also cause this error.`, { cause: error });
+      }
+    }
     if (isTransientHttpConnectError(error)) {
       return new Error(`${originalMessage} — endpoint is temporarily unavailable (HTTP 503)`, { cause: error });
     }
@@ -703,6 +1067,11 @@ export class McpServerManager {
 
   private buildClientCapabilities() {
     return {
+      extensions: {
+        "io.modelcontextprotocol/ui": {
+          mimeTypes: [RESOURCE_MIME_TYPE],
+        },
+      },
       ...(this.samplingConfig ? { sampling: {} } : {}),
       ...(this.elicitationConfig
         ? {
@@ -866,10 +1235,13 @@ export class McpServerManager {
     // mutating the persisted configuration.
     const hasCommandHeader = Object.values(definition.headers ?? {})
       .some(value => value.startsWith("!") && !value.startsWith("!!"));
-    const headers = resolveCommandSecretsRecord(
-      definition.headers,
-      key => `MCP server "${serverName}" HTTP header "${key}"`,
-    ) ?? {};
+    const oauthEnabled = supportsOAuth(definition);
+    const headers = oauthEnabled
+      ? Object.fromEntries(resolveOAuthHeaders(definition.headers))
+      : resolveCommandSecretsRecord(
+        definition.headers,
+        key => `MCP server "${serverName}" HTTP header "${key}"`,
+      ) ?? {};
 
     // Resolve bearer auth before creating requestInit so every attempted
     // transport receives the same headers.
@@ -894,27 +1266,61 @@ export class McpServerManager {
       }
     }
 
-    const requestInit = Object.keys(headers).length > 0 ? { headers } : undefined;
-    const requestFetch = definition.requestHeadersCommand
-      ? createRequestHeadersCommandFetch(definition.requestHeadersCommand)
-      : undefined;
-    const createAuthProvider = (): McpOAuthProvider => new McpOAuthProvider(
-      serverName,
-      serverUrl,
-      extractOAuthConfig(definition),
-      { onRedirect: async () => {} },
-      this.authStorageOptions,
-      this.oauthRuntime?.signal,
-    );
+    // Do not give origin-bound headers to SDK requestInit: it reuses those
+    // defaults for discovered OAuth endpoints, including other origins.
+    const requestInit = !oauthEnabled && Object.keys(headers).length > 0 ? { headers } : undefined;
+    const serviceHeaders = oauthEnabled ? new Headers(headers) : new Headers();
+    let caFetch = createCaFetch(definition);
+    try {
+    const createAuthProvider = (): McpOAuthProvider => {
+      const provider = new McpOAuthProvider(
+        serverName,
+        serverUrl,
+        extractOAuthConfig(definition),
+        { onRedirect: async () => {} },
+        this.authStorageOptions,
+        this.oauthRuntime?.signal,
+      );
+      provider.setAuthFetch(createOAuthFetch(serverUrl, () => serviceHeaders,
+        combineAbortSignals(this.oauthRuntime?.signal, signal), {
+          ...(caFetch ? { delegate: caFetch.fetch } : {}),
+        }));
+      return provider;
+    };
 
-    // Explicit OAuth checks secure storage immediately. Implicit OAuth defers
-    // provider construction until the server proves authentication is needed.
+    // Explicit OAuth checks secure storage immediately. Implicit OAuth keeps
+    // anonymous servers provider-free unless URL-bound credentials are already
+    // stored, so an unavailable credential store does not break anonymous use.
+    let implicitStoredAuth: ReturnType<typeof inspectAuthForUrl> | undefined;
+    if (definition.auth === undefined && supportsOAuth(definition)) {
+      try {
+        implicitStoredAuth = inspectAuthForUrl(serverName, serverUrl, this.authStorageOptions);
+      } catch {
+        // Implicit preflight is opportunistic; malformed records must not block
+        // an otherwise anonymous-capable server from connecting.
+      }
+    }
+    const hasImplicitStoredTokens = implicitStoredAuth?.status === "present"
+      && implicitStoredAuth.entry.tokens !== undefined;
+    if (hasImplicitStoredTokens) invalidateAuthEntryCache(serverName);
     let authState: HttpAuthProviderState = supportsOAuth(definition)
       ? definition.auth === undefined
-        ? { status: "implicit-deferred" }
+        ? hasImplicitStoredTokens
+          ? { status: "implicit-stored", provider: createAuthProvider() }
+          : { status: "implicit-deferred" }
         : { status: "explicit", provider: createAuthProvider() }
       : { status: "disabled" };
 
+    const commandFetch = definition.requestHeadersCommand
+      ? createRequestHeadersCommandFetch(definition.requestHeadersCommand, caFetch?.fetch)
+      : caFetch?.fetch;
+    const requestFetch = oauthEnabled
+      ? createOAuthFetch(serverUrl, () => serviceHeaders, this.oauthRuntime?.signal, {
+        // MCP streams outlive individual auth requests; retain SDK request deadlines.
+        timeout: false,
+        ...(commandFetch ? { delegate: commandFetch } : {}),
+      })
+      : commandFetch;
     const attempt = async (
       kind: "streamable-http" | "sse",
     ): Promise<
@@ -922,10 +1328,23 @@ export class McpServerManager {
       | { status: "failed"; client: Client; transport: Transport; error: unknown }
     > => {
       const authProvider = "provider" in authState ? authState.provider : undefined;
+      let sseFetchFailure: unknown;
+      const transportFetch: FetchLike | undefined = kind === "sse" && process.platform === "darwin" && isLiteralLocalAddress(serverUrl)
+        ? async (input, init) => {
+          try {
+            return await (requestFetch ?? globalThis.fetch)(input, init);
+          } catch (error) {
+            // EventSource discards the fetch cause before the SDK creates SseError.
+            if (localNetworkFailureCodes(error).length > 0) sseFetchFailure = error;
+            throw error;
+          }
+        }
+        : requestFetch;
       const transportOptions = {
         ...(requestInit !== undefined ? { requestInit } : {}),
-        ...(requestFetch !== undefined ? { fetch: requestFetch } : {}),
-        ...(authProvider !== undefined ? { authProvider } : {}),
+        ...(authProvider !== undefined
+          ? { fetch: createOAuthAwareFetch(transportFetch), authProvider }
+          : transportFetch !== undefined ? { fetch: transportFetch } : {}),
         ...(authProvider !== undefined
           && definition.oauth !== false
           && definition.oauth?.skipIssuerMetadataValidation === true
@@ -944,6 +1363,9 @@ export class McpServerManager {
         await this.connectClientWithAbort(client, transport, requestOptions, signal);
         return { status: "connected", client, transport };
       } catch (error) {
+        if (error instanceof SseError && sseFetchFailure !== undefined) {
+          error = new AggregateError([error, sseFetchFailure], error.message);
+        }
         const abortCleanupFailed = error instanceof AggregateError
           && error.message === "MCP connection abort cleanup failed";
         if (!abortCleanupFailed) {
@@ -964,7 +1386,24 @@ export class McpServerManager {
     let invalidated = credentialsInvalidated;
     for (;;) {
       const result = await attempt(kind);
-      if (result.status === "connected") return { ...result, credentialsInvalidated: invalidated };
+      if (result.status === "connected") {
+        const ownedCa = caFetch;
+        if (ownedCa) {
+          const close = result.transport.close.bind(result.transport);
+          const onclose = result.transport.onclose;
+          result.transport.onclose = () => {
+            void ownedCa.close().catch(error => {
+              logger.debug(`MCP: CA dispatcher cleanup failed for ${serverName}: ${String(error)}`);
+            });
+            onclose?.();
+          };
+          result.transport.close = async () => {
+            try { await close(); } finally { await ownedCa.close(); }
+          };
+          caFetch = undefined;
+        }
+        return { ...result, credentialsInvalidated: invalidated };
+      }
       if (result.error instanceof AggregateError
         && result.error.message === "MCP connection abort cleanup failed") {
         throw result.error;
@@ -997,19 +1436,39 @@ export class McpServerManager {
       }
       throw result.error;
     }
+    } finally {
+      await caFetch?.close();
+    }
   }
 
-  private async fetchAllTools(client: Client, requestOptions?: CacheableRequestOptions): Promise<McpTool[]> {
+  private async fetchAllTools(client: Client, requestOptions?: CacheableRequestOptions): Promise<ToolListResult> {
     const allTools: McpTool[] = [];
     let cursor: string | undefined;
+    let hints: ToolListCacheHints | undefined;
+    let firstPage = true;
 
     do {
       const result = await client.listTools(cursor ? { cursor } : undefined, requestOptions);
+      if (firstPage) {
+        const ttlMs = typeof result.ttlMs === "number" && Number.isSafeInteger(result.ttlMs) && result.ttlMs >= 0
+          ? result.ttlMs
+          : undefined;
+        const cacheScope = result.cacheScope === "public" || result.cacheScope === "private"
+          ? result.cacheScope
+          : undefined;
+        if (ttlMs !== undefined || cacheScope !== undefined) {
+          hints = {
+            ...(ttlMs !== undefined ? { ttlMs } : {}),
+            ...(cacheScope !== undefined ? { cacheScope } : {}),
+          };
+        }
+        firstPage = false;
+      }
       allTools.push(...(result.tools ?? []));
       cursor = result.nextCursor;
     } while (cursor);
 
-    return allTools;
+    return { tools: allTools, ...(hints !== undefined ? { hints } : {}) };
   }
 
   private async fetchAllPrompts(
@@ -1037,7 +1496,7 @@ export class McpServerManager {
     }
   }
 
-  private async fetchAllResources(client: Client, requestOptions?: RequestOptions): Promise<McpResource[]> {
+  private async fetchAllResources(client: Client, requestOptions?: RequestOptions, strict = false): Promise<McpResource[]> {
     const capabilities = client.getServerCapabilities?.();
     if (!capabilities?.resources) return [];
 
@@ -1057,12 +1516,27 @@ export class McpServerManager {
         throwIfAborted(requestOptions.signal);
       }
       if (isUnauthorizedHttpError(error)) throw error;
+      if (strict) throw error;
       // The server advertises resources but the listing failed
       return [];
     }
   }
 
   private attachAdapterNotificationHandlers(serverName: string, client: Client): void {
+    client.setNotificationHandler("notifications/resources/updated", notification => {
+      const uri = notification.params.uri;
+      const connection = this.connections.get(serverName);
+      if (!connection || connection.client !== client || connection.status !== "connected") return;
+      for (const registration of this.resourceUpdatedListeners.values()) {
+        if (registration.serverName === serverName && registration.uri === uri) {
+          try {
+            registration.listener(serverName, uri);
+          } catch {
+            // One UI listener must not block resource invalidation for others.
+          }
+        }
+      }
+    });
     client.setNotificationHandler(
       SERVER_STREAM_RESULT_PATCH_METHOD,
       { params: serverStreamResultPatchNotificationSchema.shape.params },
@@ -1095,6 +1569,7 @@ export class McpServerManager {
     try {
       this.touch(name);
       this.incrementInFlight(name);
+      await this.ensureListen(name, connection);
       return await connection.client.getPrompt(
         { name: promptName, ...(args ? { arguments: args } : {}) },
         this.getRequestOptions(name, signal),
@@ -1117,7 +1592,12 @@ export class McpServerManager {
     try {
       this.touch(name);
       this.incrementInFlight(name);
-      return await connection.client.readResource({ uri }, this.getRequestOptions(name, signal));
+      const refreshRead = await this.prepareResourceUse(name, uri, connection);
+      const requestOptions = this.getRequestOptions(name, signal);
+      return await connection.client.readResource(
+        { uri },
+        refreshRead ? { ...requestOptions, cacheMode: "refresh" } : requestOptions,
+      );
     } finally {
       this.decrementInFlight(name);
       this.touch(name);
@@ -1190,6 +1670,7 @@ export class McpServerManager {
       .flatMap(result => result.status === "rejected" ? [result.reason] : [])
       .filter(error => this.containsCleanupFailure(error));
     this.uiStreamListeners.clear();
+    this.resourceUpdatedListeners.clear();
     this.acceptedUrlElicitations.clear();
     this.pendingMetadataPublications.clear();
     this.samplingConfig = undefined;
@@ -1258,10 +1739,17 @@ export class McpServerManager {
 /**
  * Resolve environment variables with interpolation.
  */
-function resolveEnv(env: Record<string, string> | undefined, serverName: string, literalEnv = false): Record<string, string> {
+function resolveEnv(
+  env: Record<string, string> | undefined,
+  serverName: string,
+  literalEnv = false,
+  inheritEnv = true,
+): Record<string, string> {
   const resolved: Record<string, string> = {};
-  for (const [key, value] of Object.entries(process.env)) {
-    if (value !== undefined) resolved[key] = value;
+  if (inheritEnv) {
+    for (const [key, value] of Object.entries(process.env)) {
+      if (value !== undefined) resolved[key] = value;
+    }
   }
   if (literalEnv) return env ? { ...resolved, ...env } : resolved;
 

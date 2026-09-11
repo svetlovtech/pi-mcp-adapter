@@ -28,6 +28,7 @@ import {
   resolveBearerToken,
   resolveConfigPath,
   resolveServerUrl,
+  stableStringify,
 } from "./utils.ts";
 import { extractUiToolVisibility, isUiToolVisibleToModel } from "./ui-tool-visibility.ts";
 
@@ -125,6 +126,13 @@ export function isServerCacheValid(
   }
   if (!entry || entry.configHash !== configHash) return false;
   if (!entry.cachedAt || typeof entry.cachedAt !== "number") return false;
+  const declaredTtlMs = entry.ttlMs;
+  if (typeof declaredTtlMs === "number" && Number.isSafeInteger(declaredTtlMs) && declaredTtlMs >= 0) {
+    if (declaredTtlMs === 0) return false;
+    const ageMs = Date.now() - entry.cachedAt;
+    const effectiveMaxAge = maxAgeMs > 0 ? Math.min(maxAgeMs, declaredTtlMs) : declaredTtlMs;
+    return ageMs < effectiveMaxAge;
+  }
   if (maxAgeMs > 0 && Date.now() - entry.cachedAt > maxAgeMs) return false;
   return true;
 }
@@ -224,6 +232,7 @@ export function reconstructToolMetadata(
       originalName: tool.name,
       description: tool.description ?? "",
       ...(tool.inputSchema !== undefined ? { inputSchema: tool.inputSchema } : {}),
+      ...(tool.outputSchema !== undefined ? { outputSchema: tool.outputSchema } : {}),
       ...(tool.uiResourceUri !== undefined ? { uiResourceUri: tool.uiResourceUri } : {}),
       ...(tool.uiVisibility !== undefined ? { uiVisibility: tool.uiVisibility } : {}),
       ...(tool.uiStreamMode !== undefined ? { uiStreamMode: tool.uiStreamMode } : {}),
@@ -291,6 +300,7 @@ export function serializeTools(tools: McpTool[]): CachedTool[] {
         name: t.name,
         ...(t.description !== undefined ? { description: t.description } : {}),
         ...(t.inputSchema !== undefined ? { inputSchema: t.inputSchema } : {}),
+        ...(t.outputSchema !== undefined ? { outputSchema: t.outputSchema } : {}),
         ...(uiResourceUri !== undefined ? { uiResourceUri } : {}),
         ...(uiVisibility !== undefined ? { uiVisibility } : {}),
         ...(uiStreamMode !== undefined ? { uiStreamMode } : {}),
@@ -351,19 +361,6 @@ export function reconstructPromptMetadata(
       arguments: args,
     };
   });
-}
-
-function stableStringify(value: unknown): string {
-  if (value === null || value === undefined || typeof value !== "object") {
-    const serialized = JSON.stringify(value);
-    return serialized === undefined ? "undefined" : serialized;
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map(v => stableStringify(v)).join(",")}]`;
-  }
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
-  return `{${keys.map(k => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
 }
 
 function tryGetToolUiResourceUri(tool: McpTool): string | undefined {

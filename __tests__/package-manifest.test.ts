@@ -11,16 +11,22 @@ const packageJson = JSON.parse(readFileSync(join(repoRoot, "package.json"), "utf
   peerDependencies?: Record<string, string>;
   peerDependenciesMeta?: Record<string, { optional?: boolean }>;
   exports?: Record<string, unknown>;
+  scripts?: Record<string, string>;
   types?: string;
 };
 
 const hostPeerPackages = {
-  "@earendil-works/pi-ai": { peer: "^0.84.1", dev: "0.84.1" },
+  "@earendil-works/pi-ai": { peer: "^0.84.1 || ^0.85.0", dev: "0.84.1" },
   "@earendil-works/pi-tui": { peer: "*", dev: "0.84.1" },
   "typebox": { peer: "*", dev: "1.3.3" },
 };
 
 describe("package.json files", () => {
+  it("keeps the bundled MCP scripting skill available for manual use only", () => {
+    const skill = readFileSync(join(repoRoot, "skills", "mcp-scripting", "SKILL.md"), "utf-8");
+    expect(skill).toMatch(/^disable-model-invocation:\s*true\s*$/m);
+  });
+
   it("exports source entry points and plain Node host helpers", () => {
     expect(packageJson.types).toBe("./index.ts");
     expect(packageJson.exports).toMatchObject({
@@ -45,6 +51,22 @@ describe("package.json files", () => {
         default: "./dist/metadata-cache.js",
       },
     });
+  });
+
+  it("ships public host helpers without install-time prepare", () => {
+    const publishedFiles = new Set(packageJson.files ?? []);
+
+    expect(packageJson.scripts?.prepare).toBeUndefined();
+    expect(packageJson.scripts?.prepack).toBe("npm run build:public");
+    expect(publishedFiles.has("dist")).toBe(true);
+    for (const entry of Object.values(packageJson.exports ?? {})) {
+      if (!entry || typeof entry !== "object") continue;
+      for (const target of Object.values(entry)) {
+        if (typeof target === "string" && target.startsWith("./dist/")) {
+          expect(readFileSync(join(repoRoot, target), "utf-8").length).toBeGreaterThan(0);
+        }
+      }
+    }
   });
 
   it("publishes every root runtime TypeScript module", () => {
@@ -84,11 +106,13 @@ describe("package.json dependency policy", () => {
     }
   });
 
-  it("uses the stable modular SDK v2 client/core packages without the legacy monolithic SDK", () => {
+  it("pins modular SDK client/core previews to the same immutable commit", () => {
     expect(packageJson.dependencies?.["@modelcontextprotocol/ext-apps"]).toBeDefined();
     expect(packageJson.dependencies?.["@modelcontextprotocol/sdk"]).toBeUndefined();
-    expect(packageJson.dependencies?.["@modelcontextprotocol/client"]).toBe("2.0.0");
-    expect(packageJson.dependencies?.["@modelcontextprotocol/core"]).toBe("2.0.0");
+    const client = packageJson.dependencies?.["@modelcontextprotocol/client"];
+    const core = packageJson.dependencies?.["@modelcontextprotocol/core"];
+    expect(client).toMatch(/^https:\/\/pkg\.pr\.new\/@modelcontextprotocol\/client@[a-f0-9]{40}$/);
+    expect(core).toBe(client?.replace("/client@", "/core@"));
     expect(packageJson.devDependencies?.["@modelcontextprotocol/server"]).toBeUndefined();
   });
 });
